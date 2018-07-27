@@ -22,10 +22,10 @@
 #include <cstddef>
 #include <utility>
 #include <bitcoin/bitcoin.hpp>
+#include <bitcoin/database/block_state.hpp>
 #include <bitcoin/database/memory/memory.hpp>
 #include <bitcoin/database/primitives/record_manager.hpp>
 #include <bitcoin/database/result/transaction_iterator.hpp>
-#include <bitcoin/database/state/block_state.hpp>
 
 namespace libbitcoin {
 namespace database {
@@ -49,8 +49,10 @@ static const auto transactions_offset = checksum_offset + checksum_size;
 static constexpr auto no_checksum = 0u;
 
 block_result::block_result(const const_element_type& element,
-    shared_mutex& metadata_mutex, const manager& index_manager)
+    shared_mutex& metadata_mutex, const manager& index_manager,
+    const bc::settings& bitcoin_settings)
   : height_(0),
+    header_(bitcoin_settings),
     median_time_past_(0),
     state_(block_state::missing),
     checksum_(no_checksum),
@@ -110,6 +112,7 @@ hash_digest block_result::hash() const
 
 const chain::header& block_result::header() const
 {
+    // TODO: populate all metadata or only use methods?
     return header_;
 }
 
