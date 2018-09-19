@@ -44,7 +44,7 @@ public:
     block_database(const path& map_filename,
         const path& candidate_index_filename,
         const path& confirmed_index_filename, const path& tx_index_filename,
-        size_t buckets, size_t expansion, const bc::settings& bitcoin_settings);
+        size_t buckets, size_t expansion);
 
     /// Close the database (all threads must first be stopped).
     ~block_database();
@@ -85,8 +85,9 @@ public:
     // Writers.
     // ------------------------------------------------------------------------
 
-    /// Push header, validated at height.
-    void push(const chain::header& header, size_t height);
+    /// Store header, validated at height, candidate, pending (but unindexed).
+    void store(const chain::header& header, size_t height,
+        uint32_t median_time_past);
 
     /// Populate pooled block transaction references, state is unchanged.
     bool update(const chain::block& block);
@@ -95,10 +96,10 @@ public:
     bool validate(const hash_digest& hash, const code& error);
 
     /// Promote pooled|candidate block to candidate|confirmed respectively.
-    bool confirm(const hash_digest& hash, size_t height, bool candidate);
+    bool index(const hash_digest& hash, size_t height, bool candidate);
 
     /// Demote candidate|confirmed header to pooled|pooled (not candidate).
-    bool unconfirm(const hash_digest& hash, size_t height, bool candidate);
+    bool unindex(const hash_digest& hash, size_t height, bool candidate);
 
 private:
     typedef hash_digest key_type;
@@ -109,7 +110,7 @@ private:
 
     typedef message::compact_block::short_id_list short_id_list;
 
-    uint8_t confirm(const_element& element, bool positive, bool candidate);
+    uint8_t index(const_element& element, bool positive, bool candidate);
     link_type associate(const chain::transaction::list& transactions);
     void store(const chain::header& header, size_t height,
         uint32_t median_time_past, uint32_t checksum, link_type tx_start,
@@ -140,8 +141,6 @@ private:
     // This indexes txs (vs. blocks) so the link type may be differentiated.
     file_storage tx_index_file_;
     manager_type tx_index_;
-
-    const bc::settings& bitcoin_settings_;
 
     // This provides atomicity for checksum, tx_start, tx_count, state.
     mutable shared_mutex metadata_mutex_;

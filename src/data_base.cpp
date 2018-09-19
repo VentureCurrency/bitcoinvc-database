@@ -54,17 +54,12 @@ using namespace bc::wallet;
 // A failure after begin_write is returned without calling end_write.
 // This leaves the local flush lock enabled, preventing usage after restart.
 
-// TODO: tx median_time_past must be updated following block metadata.
-static constexpr uint32_t no_time = 0;
-
 // Construct.
 // ----------------------------------------------------------------------------
 
-data_base::data_base(const settings& settings,
-    const bc::settings& bitcoin_settings)
+data_base::data_base(const settings& settings)
   : closed_(true),
     settings_(settings),
-    bitcoin_settings_(bitcoin_settings),
     database::store(settings.directory, settings.index_addresses,
         settings.flush_writes)
 {
@@ -92,7 +87,7 @@ bool data_base::create(const block& genesis)
         return false;
 
     // Create files.
-    if (!store::create())
+    if (!create())
         return false;
 
     start();
@@ -140,7 +135,7 @@ void data_base::start()
 {
     blocks_ = std::make_shared<block_database>(block_table, candidate_index,
         confirmed_index, transaction_index, settings_.block_table_buckets,
-        settings_.file_growth_rate, bitcoin_settings_);
+        settings_.file_growth_rate);
 
     transactions_ = std::make_shared<transaction_database>(transaction_table,
         settings_.transaction_table_buckets, settings_.file_growth_rate,
@@ -429,13 +424,18 @@ code data_base::reorganize(const config::checkpoint& fork_point,
     block_const_ptr_list_const_ptr incoming,
     block_const_ptr_list_ptr outgoing)
 {
-    // TODO: implement.
-    return error::not_implemented;
+    if (fork_point.height() > max_size_t - incoming->size())
+        return error::operation_failed;
+
+    const auto result =
+        pop_above(outgoing, fork_point) &&
+        push_all(incoming, fork_point);
+
+    return result ? error::success : error::operation_failed;
 }
 
+// TODO: index payments.
 // Store, update, validate and confirm the presumed valid block.
-// Since genesis output is not spendable, indexing is not integrated.
-// Call data_base::index(block) to index transactions after pushing the block.
 code data_base::push(const block& block, size_t height,
     uint32_t median_time_past)
 {
@@ -447,23 +447,31 @@ code data_base::push(const block& block, size_t height,
     if (!begin_write())
         return error::store_lock_failure;
 
-    // Push the header onto the candidate chain.
-    blocks_->push(block.header(), height);
+    // Store the header.
+    blocks_->store(block.header(), height, median_time_past);
 
-    // Store the missing transactions and set tx link metadata for all.
-    if (!transactions_->store(block.transactions(), height, median_time_past))
+    // Push header reference onto the candidate index and set candidate state.
+    if (!blocks_->index(block.hash(), height, true))
         return error::operation_failed;
 
-    // Populate the block's transaction references.
+    // Store any missing txs as unconfirmed, set tx link metadata for all.
+    if (!transactions_->store(block.transactions()))
+        return error::operation_failed;
+
+    // Populate transaction references from link metadata.
     if (!blocks_->update(block))
         return error::operation_failed;
 
-    // Promote validation state to valid.
+    // Confirm all transactions (candidate state transition not requried).
+    if (!transactions_->confirm(block.transactions(), height, median_time_past))
+        return error::operation_failed;
+
+    // Promote validation state to valid (presumed valid).
     if (!blocks_->validate(block.hash(), error::success))
         return error::operation_failed;
 
-    // Promote confirmation state from candidate to confirmed.
-    if (!blocks_->confirm(block.hash(), height, false))
+    // Push header reference onto the confirmed index and set confirmed state.
+    if (!blocks_->index(block.hash(), height, false))
         return error::operation_failed;
 
     commit();
@@ -486,8 +494,9 @@ bool data_base::push_all(header_const_ptr_list_const_ptr headers,
     // Push all headers onto the fork point.
     for (size_t index = 0; index < headers->size(); ++index)
     {
-        const auto next = (*headers)[index];
-        if ((ec = push_header(*next, first_height + index)))
+        const auto& header = *((*headers)[index]);
+        const auto median_time_past = header.metadata.median_time_past;
+        if ((ec = push_header(header, first_height + index, median_time_past)))
             return false;
     }
 
@@ -515,7 +524,7 @@ bool data_base::pop_above(header_const_ptr_list_ptr headers,
     // Pop all headers above the fork point.
     for (size_t height = top; height > fork; --height)
     {
-        const auto next = std::make_shared<message::header>(bitcoin_settings_);
+        const auto next = std::make_shared<message::header>();
         if ((ec = pop_header(*next, height)))
             return false;
 
@@ -525,8 +534,10 @@ bool data_base::pop_above(header_const_ptr_list_ptr headers,
     return true;
 }
 
-// This expects header is valid and metadata.exists is populated.
-code data_base::push_header(const chain::header& header, size_t height)
+// Expects header is next candidate and metadata.exists is populated.
+// Median time past metadata is populated when the block is validated.
+code data_base::push_header(const chain::header& header, size_t height,
+    uint32_t median_time_past)
 {
     code ec;
 
@@ -541,8 +552,10 @@ code data_base::push_header(const chain::header& header, size_t height)
     if (!begin_write())
         return error::store_lock_failure;
 
-    // This will change an existing header from any state to confirmed.
-    blocks_->push(header, height);
+    if (!header.metadata.exists)
+        blocks_->store(header, height, median_time_past);
+
+    blocks_->index(header.hash(), height, true);
     blocks_->commit();
 
     return end_write() ? error::success : error::store_lock_failure;
@@ -550,7 +563,7 @@ code data_base::push_header(const chain::header& header, size_t height)
     ///////////////////////////////////////////////////////////////////////////
 }
 
-// This expects header exists at the top of the candidate index.
+// Expects header exists at the top of the candidate index.
 code data_base::pop_header(chain::header& out_header, size_t height)
 {
     code ec;
@@ -576,8 +589,8 @@ code data_base::pop_header(chain::header& out_header, size_t height)
         if (!transactions_->uncandidate(link))
             return error::operation_failed;
 
-    // Unconfirm the candidate header.
-    if (!blocks_->unconfirm(result.hash(), height, true))
+    // Unindex the candidate header.
+    if (!blocks_->unindex(result.hash(), height, true))
         return error::operation_failed;
 
     // Commit everything that was changed and return header.
@@ -594,96 +607,129 @@ code data_base::pop_header(chain::header& out_header, size_t height)
 // ----------------------------------------------------------------------------
 // protected
 
-////bool data_base::pop_above(block_const_ptr_list_ptr blocks,
-////    const config::checkpoint& fork_point)
-////{
-////    return true;
-////}
+bool data_base::push_all(block_const_ptr_list_const_ptr blocks,
+    const config::checkpoint& fork_point)
+{
+    code ec;
+    const auto first_height = fork_point.height() + 1;
 
-////bool data_base::push_all(block_const_ptr_list_const_ptr blocks,
-////    const config::checkpoint& fork_point)
-////{
-////    return true;
-////}
+    // Push all blocks onto the fork point.
+    for (size_t index = 0; index < blocks->size(); ++index)
+    {
+        const auto& block = *((*blocks)[index]);
+        if ((ec = push_block(block, first_height + index)))
+            return false;
+    }
 
-// TODO: move the block from candidate to confirmed.
-////code data_base::push(const block& block, size_t height,
-////    uint32_t median_time_past)
-////{
-////    code ec;
-////
-////    // Critical Section
-////    ///////////////////////////////////////////////////////////////////////////
-////    unique_lock lock(write_mutex_);
-////
-////    if ((ec = verify_push(block, height)))
-////        return ec;
-////
-////    //vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-////    if (!begin_write())
-////        return error::store_lock_failure;
-////
-////    // Pushes transactions sequentially as confirmed, WITHOUT ADDRESS INDEXING.
-////    if (!transactions_.store(block.transactions(), height, median_time_past,
-////        false))
-////        return error::operation_failed;
-////
-////    // Confirms transactions (and thereby also address indexes).
-////    uint32_t position = 0;
-////    for (const auto& tx: block.transactions())
-////        if (!transactions_->confirm(tx.metadata.link, height,
-////            median_time_past, position++))
-////            return error::operation_failed;
-////
-////    blocks_->push(block, height, median_time_past);
-////    commit();
-////
-////    return end_write() ? error::success : error::store_lock_failure;
-////    //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-////    ///////////////////////////////////////////////////////////////////////////
-////}
+    return true;
+}
 
-// TODO: move the block from confirmed to pooled (not candidate).
-////code data_base::pop(chain::block& out_block, size_t height)
-////{
-////    code ec;
-////
-////    // Critical Section
-////    ///////////////////////////////////////////////////////////////////////////
-////    unique_lock lock(write_mutex_);
-////
-////    if ((ec = verify_top(height, true)))
-////        return ec;
-////
-////    const auto result = blocks_->get(height, true);
-////
-////    if (!result)
-////        return error::operation_failed;
-////
-////    // Create a block for walking transactions and return.
-////    out_block = chain::block(result.header(), to_transactions(result));
-////
-////    //vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-////    if (!begin_write())
-////        return error::store_lock_failure;
-////
-////    // Deconfirms transactions (and thereby also address indexes).
-////    for (const auto& tx: block.transactions())
-////        if (!transactions_->unconfirm(tx.metadata.link))
-////            return error::operation_failed;
-////
-////    // Changes block state and height index.
-////    if (!blocks_->unconfirm(out_block.hash(), height, true))
-////        return error::operation_failed;
-////
-////    // Commit everything that was changed.
-////    commit();
-////
-////    BITCOIN_ASSERT(out_block.is_valid());
-////    return end_write() ? error::success : error::store_lock_failure;
-////    //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-////    ///////////////////////////////////////////////////////////////////////////
-////}
+bool data_base::pop_above(block_const_ptr_list_ptr blocks,
+    const config::checkpoint& fork_point)
+{
+    code ec;
+    blocks->clear();
+    if ((ec = verify(*blocks_, fork_point, false)))
+        return false;
+
+    size_t top;
+    if (!blocks_->top(top, false))
+        return false;
+
+    const auto fork = fork_point.height();
+    const auto depth = top - fork;
+    blocks->reserve(depth);
+    if (depth == 0)
+        return true;
+
+    // Pop all blocks above the fork point.
+    for (size_t height = top; height > fork; --height)
+    {
+        const auto next = std::make_shared<message::block>();
+        if ((ec = pop_block(*next, height)))
+            return false;
+
+        blocks->insert(blocks->begin(), next);
+    }
+
+    return true;
+}
+
+code data_base::push_block(const block& block, size_t height)
+{
+    code ec;
+    BITCOIN_ASSERT(block.header().metadata.state);
+    auto median_time_past = block.header().metadata.state->median_time_past();
+
+    // Critical Section
+    ///////////////////////////////////////////////////////////////////////////
+    unique_lock lock(write_mutex_);
+
+    if ((ec = verify_push(*blocks_, block, height)))
+        return ec;
+
+    //vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+    if (!begin_write())
+        return error::store_lock_failure;
+
+    // Confirm txs (and thereby also address indexes), spend prevouts.
+    uint32_t position = 0;
+    for (const auto& tx: block.transactions())
+        if (!transactions_->confirm(tx.metadata.link, height, median_time_past,
+            position++))
+            return error::operation_failed;
+
+    // Confirm candidate block (candidate index unchanged).
+    if (!blocks_->index(block.hash(), height, false))
+        return error::operation_failed;
+
+    commit();
+
+    return end_write() ? error::success : error::store_lock_failure;
+    //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///////////////////////////////////////////////////////////////////////////
+}
+
+code data_base::pop_block(chain::block& out_block, size_t height)
+{
+    code ec;
+
+    // Critical Section
+    ///////////////////////////////////////////////////////////////////////////
+    unique_lock lock(write_mutex_);
+
+    if ((ec = verify_top(*blocks_, height, false)))
+        return ec;
+
+    const auto result = blocks_->get(height, false);
+
+    if (!result)
+        return error::operation_failed;
+
+    // Create a block for walking transactions and return.
+    out_block = chain::block(result.header(), to_transactions(result));
+    BITCOIN_ASSERT(out_block.hash() == result.hash());
+
+    //vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+    if (!begin_write())
+        return error::store_lock_failure;
+
+    // Deconfirm txs (and thereby also address indexes), unspend prevouts.
+    for (const auto& tx: out_block.transactions())
+        if (!transactions_->unconfirm(tx.metadata.link))
+            return error::operation_failed;
+
+    // Unconfirm confirmed block (candidate index unchanged).
+    if (!blocks_->unindex(result.hash(), height, false))
+        return error::operation_failed;
+
+    commit();
+
+    BITCOIN_ASSERT(out_block.is_valid());
+    return end_write() ? error::success : error::store_lock_failure;
+    //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///////////////////////////////////////////////////////////////////////////
+}
 
 // Utilities.
 // ----------------------------------------------------------------------------

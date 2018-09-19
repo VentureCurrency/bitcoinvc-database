@@ -255,14 +255,14 @@ bool transaction_database::get_output(const output_point& point,
 // Store new unconfirmed tx and set tx link metadata in any case.
 bool transaction_database::store(const chain::transaction& tx, uint32_t forks)
 {
-    return store(tx, forks, no_time, transaction_result::unconfirmed);
+    return storize(tx, forks, no_time, transaction_result::unconfirmed);
 }
 
 // Store each new tx of the unconfirmed block and set tx link metadata for all.
 bool transaction_database::store(const transaction::list& transactions)
 {
     for (const auto& tx: transactions)
-        if (!store(tx, rule_fork::unverified, no_time,
+        if (!storize(tx, rule_fork::unverified, no_time,
             transaction_result::unconfirmed))
             return false;
 
@@ -275,14 +275,14 @@ bool transaction_database::store(const chain::transaction::list& transactions,
 {
     size_t position = 0;
     for (const auto& tx: transactions)
-        if (!store(tx, height, median_time_past, position++))
+        if (!storize(tx, height, median_time_past, position++))
             return false;
 
     return true;
 }
 
 // private
-bool transaction_database::store(const chain::transaction& tx, size_t height,
+bool transaction_database::storize(const chain::transaction& tx, size_t height,
     uint32_t median_time_past, size_t position)
 {
     BITCOIN_ASSERT(height <= max_uint32);
@@ -291,6 +291,7 @@ bool transaction_database::store(const chain::transaction& tx, size_t height,
     // Assume the caller has not tested for existence (true for block update).
     if (tx.metadata.link == transaction::validation::unlinked)
     {
+        // TODO: create an optimal tx.link getter for this.
         const auto result = get(tx.hash());
 
         if (result)
@@ -309,7 +310,7 @@ bool transaction_database::store(const chain::transaction& tx, size_t height,
         serial.write_4_bytes_little_endian(static_cast<uint32_t>(height));
         serial.write_2_bytes_little_endian(static_cast<uint16_t>(position));
         serial.write_byte(transaction_result::candidate_false);
-        serial.write_4_bytes_little_endian(no_time);
+        serial.write_4_bytes_little_endian(median_time_past);
         tx.to_data(serial, false, true);
     };
 
@@ -331,17 +332,12 @@ bool transaction_database::candidate(file_offset link)
     return candidate(link, true);
 }
 
-bool transaction_database::uncandidate(file_offset link)
-{
-    return candidate(link, false);
-}
-
 // private
 bool transaction_database::candidate(file_offset link, bool positive)
 {
     const auto result = get(link);
 
-    if (!result || !update(link, positive))
+    if (!result || !candidize(link, positive))
         return false;
 
     // Spend or unspend the candidate tx's previous outputs.
@@ -350,6 +346,11 @@ bool transaction_database::candidate(file_offset link, bool positive)
             return false;
 
     return true;
+}
+
+bool transaction_database::uncandidate(file_offset link)
+{
+    return candidate(link, false);
 }
 
 // private
@@ -388,7 +389,7 @@ bool transaction_database::candidate_spend(const chain::output_point& point,
         serial.read_size_little_endian();
 
         // Skip outputs until the target output.
-        for (uint32_t output = 0; output < point.index(); ++output)
+        for (auto output = 0u; output < point.index(); ++output)
         {
             serial.skip(spend_size);
             serial.skip(serial.read_size_little_endian());
@@ -407,7 +408,7 @@ bool transaction_database::candidate_spend(const chain::output_point& point,
 }
 
 // private
-bool transaction_database::update(link_type link, bool candidate)
+bool transaction_database::candidize(link_type link, bool candidate)
 {
     const auto element = hash_table_.find(link);
 
@@ -432,11 +433,15 @@ bool transaction_database::update(link_type link, bool candidate)
 // Confirm/Unconfirm.
 // ----------------------------------------------------------------------------
 
-bool transaction_database::unconfirm(file_offset link)
+bool transaction_database::confirm(const transaction::list& transactions,
+    size_t height, uint32_t median_time_past)
 {
-    // The tx was verified under a now unknown chain state, so set unverified.
-    return confirm(link, rule_fork::unverified, no_time,
-        transaction_result::unconfirmed);
+    uint32_t position = 0;
+    for (const auto& tx: transactions)
+        if (!confirm(tx.metadata.link, height, median_time_past, position++))
+            return false;
+
+    return true;
 }
 
 bool transaction_database::confirm(file_offset link, size_t height,
@@ -459,7 +464,14 @@ bool transaction_database::confirm(file_offset link, size_t height,
         cache_.add(result.transaction(), height, median_time_past, confirmed);
 
     // Promote the tx that already exists.
-    return update(link, height, median_time_past, position, false);
+    return confirmize(link, height, median_time_past, position);
+}
+
+bool transaction_database::unconfirm(file_offset link)
+{
+    // The tx was verified under a now unknown chain state, so set unverified.
+    return confirm(link, rule_fork::unverified, no_time,
+        transaction_result::unconfirmed);
 }
 
 // private
@@ -512,7 +524,7 @@ bool transaction_database::confirmed_spend(const output_point& point,
         serial.read_size_little_endian();
 
         // Skip outputs until the target output.
-        for (uint32_t output = 0; output < point.index(); ++output)
+        for (auto output = 0u; output < point.index(); ++output)
         {
             serial.skip(spend_size);
             serial.skip(serial.read_size_little_endian());
@@ -532,8 +544,8 @@ bool transaction_database::confirmed_spend(const output_point& point,
 }
 
 // private
-bool transaction_database::update(link_type link, size_t height,
-    uint32_t median_time_past, size_t position, bool candidate)
+bool transaction_database::confirmize(link_type link, size_t height,
+    uint32_t median_time_past, size_t position)
 {
     BITCOIN_ASSERT(height <= max_uint32);
     BITCOIN_ASSERT(position <= max_uint16);
@@ -549,8 +561,7 @@ bool transaction_database::update(link_type link, size_t height,
         unique_lock lock(metadata_mutex_);
         serial.write_4_bytes_little_endian(static_cast<uint32_t>(height));
         serial.write_2_bytes_little_endian(static_cast<uint16_t>(position));
-        serial.write_byte(candidate ? transaction_result::candidate_true :
-            transaction_result::candidate_false);
+        serial.write_byte(transaction_result::candidate_false);
         serial.write_4_bytes_little_endian(median_time_past);
         ///////////////////////////////////////////////////////////////////////
     };

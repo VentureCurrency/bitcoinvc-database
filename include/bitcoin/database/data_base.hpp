@@ -43,13 +43,16 @@ class BCD_API data_base
 public:
     typedef std::function<void(const code&)> result_handler;
 
-    data_base(const settings& settings, const bc::settings& bitocin_settings);
+    data_base(const settings& settings);
 
     // Open and close.
     // ------------------------------------------------------------------------
 
     /// Create and open all databases.
     bool create(const chain::block& genesis);
+
+    // Expose polymorphic create method from base.
+    using store::create;
 
     /// Open all databases.
     bool open() override;
@@ -127,19 +130,19 @@ protected:
         const config::checkpoint& fork_point);
     bool pop_above(header_const_ptr_list_ptr headers,
         const config::checkpoint& fork_point);
-    code push_header(const chain::header& header, size_t height);
+    code push_header(const chain::header& header, size_t height,
+        uint32_t median_time_past);
     code pop_header(chain::header& out_header, size_t height);
 
     // Block reorganization.
     // ------------------------------------------------------------------------
 
-    ////bool push_all(block_const_ptr_list_const_ptr blocks,
-    ////    const config::checkpoint& fork_point);
-    ////bool pop_above(block_const_ptr_list_ptr headers,
-    ////    const config::checkpoint& fork_point);
-    ////code push(const chain::block& block, size_t height,
-    //      uint32_t median_time_past);
-    ////code pop(chain::block& out_block, size_t height);
+    bool push_all(block_const_ptr_list_const_ptr blocks,
+        const config::checkpoint& fork_point);
+    bool pop_above(block_const_ptr_list_ptr headers,
+        const config::checkpoint& fork_point);
+    code push_block(const chain::block& block, size_t height);
+    code pop_block(chain::block& out_block, size_t height);
 
 
     // Databases.
@@ -154,7 +157,6 @@ private:
 
     std::atomic<bool> closed_;
     const settings& settings_;
-    const bc::settings& bitcoin_settings_;
 
     // Used to prevent unsafe concurrent writes.
     mutable shared_mutex write_mutex_;
